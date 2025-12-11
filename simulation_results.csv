@@ -1,0 +1,4 @@
+Scenario,Avg Profit,Profit CI,Avg Throughput,Service Rate,Cashiers,Baristas,Shelf Capacity
+Base Configuration,$2876.60,"($2421.20, $3332.00)",1524.4,38.87%,2,3,15
+Increased Staff,$4512.00,"($4233.33, $4790.67)",1754.8,44.14%,3,4,15
+Larger Pickup Shelf,$3071.30,"($2672.66, $3469.94)",1529.8,39.04%,2,3,25
