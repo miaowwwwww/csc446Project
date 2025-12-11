@@ -1,3 +1,6 @@
+ 
+# IMPORT REQUIRED LIBRARIES
+ 
 import simpy
 import numpy as np
 import pandas as pd
@@ -18,6 +21,9 @@ plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
 
 
+ 
+# CONFIGURATION CLASS
+ 
 class TimHortonsConfig:
     """Configuration for the Tim Hortons simulation"""
 
@@ -67,10 +73,10 @@ class TimHortonsConfig:
         self.BALK_PENALTY = 3.00
         self.SLA_VIOLATION_PENALTY = 2.00
 
-        # Priority policy (new parameter)
-        self.PRIORITIZE_MOBILE = False  # If True, mobile orders get priority at pack station
 
-
+ 
+# CUSTOMER CLASS
+ 
 class Customer:
     """Represents a customer in the system"""
 
@@ -86,6 +92,225 @@ class Customer:
         self.service_times = {}
         self.reneged = False
         self.balked = False
+
+    def calculate_wait_times(self):
+        """Calculate various wait times"""
+        times = {
+            'order_to_kitchen': None,
+            'kitchen_to_pack': None,
+            'total_system_time': None
+        }
+
+        if self.order_placed_time and self.order_ready_time:
+            times['order_to_kitchen'] = self.order_ready_time - self.order_placed_time
+        if self.order_ready_time and self.pickup_time:
+            times['kitchen_to_pack'] = self.pickup_time - self.order_ready_time
+        if self.arrival_time and self.pickup_time:
+            times['total_system_time'] = self.pickup_time - self.arrival_time
+
+        return times
+
+
+ 
+# MAIN SIMULATION CLASS
+ 
+class TimHortonsSimulation:
+    """Main discrete-event simulation for Tim Hortons"""
+
+    def __init__(self, config, random_seed):
+        self.env = simpy.Environment()
+        self.config = config
+        self.random_seed = random_seed
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+
+        # Initialize resources
+        self.cashiers = simpy.Resource(self.env, config.NUM_CASHIERS)
+        self.drive_thru_servers = simpy.Resource(self.env, config.NUM_DRIVE_THRU_SERVERS)
+        self.baristas = simpy.Resource(self.env, config.NUM_BARISTAS)
+        self.cooks = simpy.Resource(self.env, config.NUM_COOKS)
+        self.packers = simpy.Resource(self.env, config.NUM_PACKERS)
+        self.bussers = simpy.Resource(self.env, config.NUM_BUSSERS)
+
+        # Finite-capacity buffers
+        self.pickup_shelf = simpy.Store(self.env, capacity=config.PICKUP_SHELF_CAPACITY)
+        self.drive_thru_queue = simpy.Store(self.env, capacity=config.DRIVE_THRU_LANE_CAPACITY)
+        self.seating_area = simpy.Resource(self.env, config.SEATING_CAPACITY)
+
+        # Statistics collection
+        self.customers = []
+        self.completed_customers = []
+        self.reneged_customers = 0
+        self.balked_customers = 0
+        self.resource_utilization = defaultdict(list)
+
+        # Performance metrics
+        self.metrics = {
+            'throughput': defaultdict(int),
+            'wait_times': defaultdict(list),
+            'queue_lengths': defaultdict(list),
+            'utilization': defaultdict(float)
+        }
+
+    def generate_arrival_process(self, channel, rate):
+        """Generate customers according to Poisson process"""
+        customer_id = 0
+        while True:
+            # Time-varying arrival rates (simplified peak/off-peak)
+            current_hour = (self.env.now % (24 * 60)) // 60
+            if 7 <= current_hour <= 9 or 11 <= current_hour <= 13:  # Peak hours
+                adjusted_rate = rate * 1.5
+            else:
+                adjusted_rate = rate * 0.7
+
+            interarrival = np.random.exponential(1 / adjusted_rate)
+            yield self.env.timeout(interarrival)
+
+            customer_id += 1
+            customer = Customer(self.env, customer_id, channel, self.env.now, self.config)
+            self.customers.append(customer)
+
+            if channel == 'walk_in':
+                self.env.process(self.walk_in_process(customer))
+            elif channel == 'drive_thru':
+                self.env.process(self.drive_thru_process(customer))
+            else:  # mobile
+                self.env.process(self.mobile_process(customer))
+
+    def walk_in_process(self, customer):
+        """Process for walk-in customers"""
+        # Check for balking (simplified)
+        queue_length = len(self.cashiers.queue)
+        if queue_length > 10:  # Arbitrary balking threshold
+            customer.balked = True
+            self.balked_customers += 1
+            return
+
+        # Order at cashier
+        with self.cashiers.request() as request:
+            yield request
+            start_time = self.env.now
+            customer.order_placed_time = start_time
+            service_time = np.random.exponential(self.config.CASHIER_MEAN)
+            yield self.env.timeout(service_time)
+            customer.service_times['cashier'] = self.env.now - start_time
+
+        # Process through kitchen
+        yield from self.kitchen_process(customer)
+
+    def drive_thru_process(self, customer):
+        """Process for drive-thru customers"""
+        # Check for balking based on lane capacity
+        if len(self.drive_thru_queue.items) >= self.config.DRIVE_THRU_LANE_CAPACITY:
+            customer.balked = True
+            self.balked_customers += 1
+            return
+
+        # Enter drive-thru queue
+        with self.drive_thru_queue.put(customer):
+            # Order station
+            with self.drive_thru_servers.request() as request:
+                yield request
+                start_time = self.env.now
+                customer.order_placed_time = start_time
+                service_time = np.random.exponential(self.config.DRIVE_THRU_ORDER_MEAN)
+                yield self.env.timeout(service_time)
+                customer.service_times['drive_thru_order'] = self.env.now - start_time
+
+            # Process through kitchen
+            yield from self.kitchen_process(customer, is_drive_thru=True)
+
+    def mobile_process(self, customer):
+        """Process for mobile orders"""
+        # Mobile orders have promised pickup time (e.g., 15 minutes)
+        promised_time = self.env.now + 15
+
+        # Process through kitchen immediately
+        customer.order_placed_time = self.env.now
+        yield from self.kitchen_process(customer, is_mobile=True)
+
+        # Check for reneging if order not ready by promised time
+        if self.env.now > promised_time and not customer.order_ready_time:
+            wait_time = self.env.now - promised_time
+            if np.random.random() < min(wait_time / 30, 0.8):  # Increasing probability with wait
+                customer.reneged = True
+                self.reneged_customers += 1
+                return
+
+    def kitchen_process(self, customer, is_drive_thru=False, is_mobile=False):
+        """Process order through kitchen network"""
+        # Beverage preparation
+        with self.baristas.request() as request:
+            yield request
+            start_time = self.env.now
+            service_time = np.random.exponential(self.config.BEVERAGE_MEAN)
+
+            # Simulate occasional espresso machine maintenance
+            if np.random.random() < 0.01:  # 1% chance of maintenance delay
+                yield self.env.timeout(5)  # 5-minute maintenance
+
+            yield self.env.timeout(service_time)
+            customer.service_times['beverage'] = self.env.now - start_time
+
+        # Food preparation (parallel with beverage)
+        with self.cooks.request() as request:
+            yield request
+            start_time = self.env.now
+            service_time = np.random.exponential(self.config.FOOD_PREP_MEAN)
+            yield self.env.timeout(service_time)
+            customer.service_times['food'] = self.env.now - start_time
+
+        # Wait for both beverage and food
+        customer.order_ready_time = self.env.now
+
+        # Packing
+        with self.packers.request() as request:
+            yield request
+            start_time = self.env.now
+
+            # Check pickup shelf capacity (blocking if full)
+            if not is_drive_thru:
+                if len(self.pickup_shelf.items) >= self.config.PICKUP_SHELF_CAPACITY:
+                    # Block until space available
+                    while len(self.pickup_shelf.items) >= self.config.PICKUP_SHELF_CAPACITY:
+                        yield self.env.timeout(0.1)
+
+            service_time = np.random.exponential(self.config.PACKING_MEAN)
+            yield self.env.timeout(service_time)
+            customer.service_times['packing'] = self.env.now - start_time
+
+        # Pickup
+        customer.pickup_time = self.env.now
+        self.completed_customers.append(customer)
+
+        # Record completion
+        self.metrics['throughput'][customer.channel] += 1
+
+    def collect_statistics(self):
+        """Collect statistics during simulation"""
+        while True:
+            # Record queue lengths
+            self.metrics['queue_lengths']['cashier'].append(len(self.cashiers.queue))
+            self.metrics['queue_lengths']['drive_thru'].append(len(self.drive_thru_queue.items))
+            self.metrics['queue_lengths']['pickup_shelf'].append(len(self.pickup_shelf.items))
+
+            # Record utilization (simplified)
+            yield self.env.timeout(5)  # Every 5 minutes
+
+    def run(self):
+        """Run the simulation"""
+        # Start arrival processes
+        self.env.process(self.generate_arrival_process('walk_in', self.config.WALK_IN_RATE))
+        self.env.process(self.generate_arrival_process('drive_thru', self.config.DRIVE_THRU_RATE))
+        self.env.process(self.generate_arrival_process('mobile', self.config.MOBILE_RATE))
+
+        # Start statistics collection
+        self.env.process(self.collect_statistics())
+
+        # Run simulation
+        self.env.run(until=self.config.SIMULATION_DURATION)
+
+        return self.calculate_final_metrics()
 
     def calculate_final_metrics(self):
         """Calculate final performance metrics"""
@@ -122,14 +347,6 @@ class Customer:
         metrics['total_customers'] = len(self.customers)
         metrics['service_rate'] = len(self.completed_customers) / len(self.customers) if self.customers else 0
 
-        # Priority statistics (if applicable)
-        if hasattr(self.config, 'PRIORITIZE_MOBILE') and self.config.PRIORITIZE_MOBILE:
-            metrics['mobile_priority_events'] = self.metrics.get('mobile_priority_events', 0)
-            metrics['priority_utilization'] = self.metrics['priority_stats']['mobile_priority_used'] / max(1,
-                                                                                                           self.metrics[
-                                                                                                               'priority_stats'][
-                                                                                                               'total_packing_events'])
-
         # Calculate profit
         revenue = len(self.completed_customers) * self.config.AVERAGE_ORDER_VALUE
         labor_cost = self.calculate_labor_cost()
@@ -143,124 +360,51 @@ class Customer:
 
         return metrics
 
+    def calculate_labor_cost(self):
+        """Calculate total labor cost for the day"""
+        hours_worked = self.config.SIMULATION_DURATION / 60
+        total_cost = 0
 
-class TimHortonsSimulation:
-    """Main discrete-event simulation for Tim Hortons"""
+        for role, hourly_rate in self.config.HOURLY_LABOR_COST.items():
+            if role == 'cashier':
+                count = self.config.NUM_CASHIERS
+            elif role == 'drive_thru':
+                count = self.config.NUM_DRIVE_THRU_SERVERS
+            elif role == 'barista':
+                count = self.config.NUM_BARISTAS
+            elif role == 'cook':
+                count = self.config.NUM_COOKS
+            elif role == 'packer':
+                count = self.config.NUM_PACKERS
+            else:  # busser
+                count = self.config.NUM_BUSSERS
 
-    def __init__(self, config, random_seed):
-        self.env = simpy.Environment()
-        self.config = config
-        self.random_seed = random_seed
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+            total_cost += count * hourly_rate * hours_worked
 
-        # Initialize resources
-        self.cashiers = simpy.Resource(self.env, config.NUM_CASHIERS)
-        self.drive_thru_servers = simpy.Resource(self.env, config.NUM_DRIVE_THRU_SERVERS)
-        self.baristas = simpy.Resource(self.env, config.NUM_BARISTAS)
-        self.cooks = simpy.Resource(self.env, config.NUM_COOKS)
-        self.packers = simpy.Resource(self.env, config.NUM_PACKERS)
-        self.bussers = simpy.Resource(self.env, config.NUM_BUSSERS)
+        return total_cost
 
-        # For priority packing, we'll track orders waiting for packing
-        self.packing_queue_mobile = []  # Mobile orders waiting
-        self.packing_queue_other = []  # Walk-in and drive-thru orders waiting
-        self.packing_in_progress = []  # Orders being packed
+    def calculate_penalties(self):
+        """Calculate penalties for customer dissatisfaction"""
+        penalties = 0
+        penalties += self.reneged_customers * self.config.RENEGE_PENALTY
+        penalties += self.balked_customers * self.config.BALK_PENALTY
 
-        # Finite-capacity buffers
-        self.pickup_shelf = simpy.Store(self.env, capacity=config.PICKUP_SHELF_CAPACITY)
-        self.drive_thru_queue = simpy.Store(self.env, capacity=config.DRIVE_THRU_LANE_CAPACITY)
-        self.seating_area = simpy.Resource(self.env, config.SEATING_CAPACITY)
+        # SLA violations for mobile orders
+        mobile_violations = 0
+        for customer in self.completed_customers:
+            if customer.channel == 'mobile' and customer.order_placed_time:
+                promised_time = customer.order_placed_time + 15
+                if customer.pickup_time and customer.pickup_time > promised_time:
+                    mobile_violations += 1
 
-        # Statistics collection
-        self.customers = []
-        self.completed_customers = []
-        self.reneged_customers = 0
-        self.balked_customers = 0
-        self.resource_utilization = defaultdict(list)
+        penalties += mobile_violations * self.config.SLA_VIOLATION_PENALTY
 
-        # Performance metrics
-        self.metrics = {
-            'throughput': defaultdict(int),
-            'wait_times': defaultdict(list),
-            'queue_lengths': defaultdict(list),
-            'utilization': defaultdict(float),
-            'priority_stats': {
-                'mobile_priority_used': 0,
-                'total_packing_events': 0
-            }
-        }
-
-    def kitchen_process(self, customer, is_drive_thru=False, is_mobile=False):
-        """Process order through kitchen network"""
-        # Beverage preparation
-        with self.baristas.request() as request:
-            yield request
-            start_time = self.env.now
-            service_time = np.random.exponential(self.config.BEVERAGE_MEAN)
-
-            # Simulate occasional espresso machine maintenance
-            if np.random.random() < 0.01:  # 1% chance of maintenance delay
-                yield self.env.timeout(5)  # 5-minute maintenance
-
-            yield self.env.timeout(service_time)
-            customer.service_times['beverage'] = self.env.now - start_time
-
-        # Food preparation (parallel with beverage)
-        with self.cooks.request() as request:
-            yield request
-            start_time = self.env.now
-            service_time = np.random.exponential(self.config.FOOD_PREP_MEAN)
-            yield self.env.timeout(service_time)
-            customer.service_times['food'] = self.env.now - start_time
-
-        # Wait for both beverage and food
-        customer.order_ready_time = self.env.now
-
-        # Packing with priority policy
-        with self.packers.request() as request:
-            yield request
-            start_time = self.env.now
-
-            # If prioritizing mobile orders and this is a mobile order,
-            # we need to handle it specially
-            if self.config.PRIORITIZE_MOBILE and is_mobile:
-                # In a real priority system, we would preempt other orders
-                # For simplicity, we'll just reduce packing time for mobile orders
-                # by 20% to simulate priority
-                service_time = np.random.exponential(self.config.PACKING_MEAN) * 0.8
-                self.metrics['priority_stats']['mobile_priority_used'] += 1
-            else:
-                service_time = np.random.exponential(self.config.PACKING_MEAN)
-
-            self.metrics['priority_stats']['total_packing_events'] += 1
-
-            # Check pickup shelf capacity (blocking if full)
-            if not is_drive_thru:
-                if len(self.pickup_shelf.items) >= self.config.PICKUP_SHELF_CAPACITY:
-                    # Block until space available
-                    while len(self.pickup_shelf.items) >= self.config.PICKUP_SHELF_CAPACITY:
-                        yield self.env.timeout(0.1)
-
-            yield self.env.timeout(service_time)
-            customer.service_times['packing'] = self.env.now - start_time
-
-        # Pickup
-        customer.pickup_time = self.env.now
-        self.completed_customers.append(customer)
-
-        # Record completion
-        self.metrics['throughput'][customer.channel] += 1
-
-        # Record priority statistics in metrics
-        if 'mobile_priority_events' not in self.metrics:
-            self.metrics['mobile_priority_events'] = 0
-        if self.config.PRIORITIZE_MOBILE and is_mobile:
-            self.metrics['mobile_priority_events'] += 1
+        return penalties
 
 
+ 
 # EXPERIMENT RUNNER CLASS
-
+ 
 class ExperimentRunner:
     """Runs multiple simulation scenarios and collects results"""
 
@@ -282,7 +426,7 @@ class ExperimentRunner:
                 'num_cooks': base_config.NUM_COOKS,
                 'pickup_shelf_capacity': base_config.PICKUP_SHELF_CAPACITY,
                 'drive_thru_capacity': base_config.DRIVE_THRU_LANE_CAPACITY,
-                'priority_policy': 'FIFO'
+                'drive_thru_servers': base_config.NUM_DRIVE_THRU_SERVERS
             }
         })
 
@@ -300,11 +444,11 @@ class ExperimentRunner:
                 'num_cooks': config2.NUM_COOKS,
                 'pickup_shelf_capacity': config2.PICKUP_SHELF_CAPACITY,
                 'drive_thru_capacity': config2.DRIVE_THRU_LANE_CAPACITY,
-                'priority_policy': 'FIFO'
+                'drive_thru_servers': config2.NUM_DRIVE_THRU_SERVERS
             }
         })
 
-        # Scenario 3: Increased Drive-thru Capacity (replaces Larger Pickup Shelf)
+        # Scenario 3: Increased Drive-thru Capacity
         config3 = TimHortonsConfig()
         config3.DRIVE_THRU_LANE_CAPACITY = 15  # Increased from 8 to 15
         config3.NUM_DRIVE_THRU_SERVERS = 3  # Increased from 2 to 3
@@ -317,8 +461,7 @@ class ExperimentRunner:
                 'num_cooks': config3.NUM_COOKS,
                 'pickup_shelf_capacity': config3.PICKUP_SHELF_CAPACITY,
                 'drive_thru_capacity': config3.DRIVE_THRU_LANE_CAPACITY,
-                'drive_thru_servers': config3.NUM_DRIVE_THRU_SERVERS,
-                'priority_policy': 'FIFO'
+                'drive_thru_servers': config3.NUM_DRIVE_THRU_SERVERS
             }
         })
 
@@ -347,9 +490,325 @@ class ExperimentRunner:
 
         return scenario_results, avg_metrics
 
+    def calculate_average_metrics(self, metrics_list):
+        """Calculate average metrics across multiple replications"""
+        if not metrics_list:
+            return {}
 
+        avg_metrics = {}
+        all_keys = set()
+
+        # Collect all keys from all metrics dictionaries
+        for metrics in metrics_list:
+            all_keys.update(metrics.keys())
+
+        # Calculate averages for each key
+        for key in all_keys:
+            values = []
+            for metrics in metrics_list:
+                if key in metrics and isinstance(metrics[key], (int, float, np.number)):
+                    values.append(metrics[key])
+
+            if values:
+                avg_metrics[key] = np.mean(values)
+                avg_metrics[f'{key}_std'] = np.std(values)
+                avg_metrics[f'{key}_min'] = np.min(values)
+                avg_metrics[f'{key}_max'] = np.max(values)
+
+        return avg_metrics
+
+    def run_all_scenarios(self):
+        """Run all defined scenarios"""
+        print("Running Tim Hortons Simulation Experiments")
+        print("=" * 50)
+
+        self.define_scenarios()
+
+        for scenario in self.scenarios:
+            print(f"\nScenario: {scenario['name']}")
+            print(f"Parameters: {scenario['parameters']}")
+            print("-" * 30)
+
+            results, avg_metrics = self.run_scenario(scenario)
+
+            # Calculate statistics across replications
+            all_metrics = [r['metrics'] for r in results]
+            df = pd.DataFrame(all_metrics)
+
+            scenario_summary = {
+                'scenario_name': scenario['name'],
+                'parameters': scenario['parameters'],
+                'replications': len(results),
+                'detailed_results': results,
+                'average_metrics': avg_metrics,
+                'raw_metrics_data': all_metrics
+            }
+
+            # Calculate confidence intervals for key metrics
+            key_metrics = ['profit', 'total_throughput', 'service_rate']
+            for metric in key_metrics:
+                if metric in df.columns:
+                    data = df[metric]
+                    scenario_summary[f'{metric}_mean'] = data.mean()
+                    scenario_summary[f'{metric}_std'] = data.std()
+                    scenario_summary[f'{metric}_ci'] = self.calculate_confidence_interval(data)
+
+            self.results.append(scenario_summary)
+
+            # Display average stats for this scenario
+            self.display_scenario_averages(scenario_summary)
+
+        return self.results
+
+    def display_scenario_averages(self, scenario_summary):
+        """Display average statistics for a scenario"""
+        print(f"\nAverage Statistics for {scenario_summary['scenario_name']} (5 runs):")
+        print("-" * 40)
+
+        avg_metrics = scenario_summary['average_metrics']
+
+        # Financial metrics
+        print("\nFinancial Metrics:")
+        print(f"  Average Daily Profit: ${avg_metrics.get('profit', 0):.2f}")
+        print(f"  Std Dev of Profit: ${avg_metrics.get('profit_std', 0):.2f}")
+        print(f"  Min Profit: ${avg_metrics.get('profit_min', 0):.2f}")
+        print(f"  Max Profit: ${avg_metrics.get('profit_max', 0):.2f}")
+
+        # Throughput metrics
+        print("\nThroughput Metrics:")
+        print(f"  Average Total Throughput: {avg_metrics.get('total_throughput', 0):.0f}")
+        print(f"  Walk-in Throughput: {avg_metrics.get('walk_in_throughput', 0):.0f}")
+        print(f"  Drive-thru Throughput: {avg_metrics.get('drive_thru_throughput', 0):.0f}")
+        print(f"  Mobile Throughput: {avg_metrics.get('mobile_throughput', 0):.0f}")
+
+        # Wait time metrics (if available)
+        if 'walk_in_avg_wait' in avg_metrics:
+            print("\nWait Time Metrics (minutes):")
+            print(f"  Walk-in Avg Wait: {avg_metrics.get('walk_in_avg_wait', 0):.1f}")
+            print(f"  Drive-thru Avg Wait: {avg_metrics.get('drive_thru_avg_wait', 0):.1f}")
+            print(f"  Mobile Avg Wait: {avg_metrics.get('mobile_avg_wait', 0):.1f}")
+
+        # Queue metrics
+        if 'cashier_avg_length' in avg_metrics:
+            print("\nQueue Metrics:")
+            print(f"  Avg Cashier Queue Length: {avg_metrics.get('cashier_avg_length', 0):.1f}")
+            print(f"  Avg Drive-thru Queue Length: {avg_metrics.get('drive_thru_avg_length', 0):.1f}")
+
+        # Customer dissatisfaction
+        print("\nCustomer Dissatisfaction:")
+        print(f"  Average Balked Customers: {avg_metrics.get('balked_customers', 0):.0f}")
+        print(f"  Average Reneged Customers: {avg_metrics.get('reneged_customers', 0):.0f}")
+        print(f"  Average Service Rate: {avg_metrics.get('service_rate', 0) * 100:.1f}%")
+
+        # Confidence intervals
+        if 'profit_ci' in scenario_summary:
+            ci_lower, ci_upper = scenario_summary['profit_ci']
+            print(f"\n95% Confidence Interval for Profit: (${ci_lower:.2f}, ${ci_upper:.2f})")
+
+    def calculate_confidence_interval(self, data, confidence=0.95):
+        """Calculate confidence interval for a dataset"""
+        n = len(data)
+        if n < 2:
+            return (0, 0)
+
+        mean = np.mean(data)
+        std_err = stats.sem(data)
+        h = std_err * stats.t.ppf((1 + confidence) / 2, n - 1)
+
+        return (mean - h, mean + h)
+
+    def analyze_results(self):
+        """Perform comparative analysis of all scenarios"""
+        if not self.results:
+            print("No results to analyze. Run scenarios first.")
+            return
+
+        print("\n" + "=" * 50)
+        print("COMPARATIVE ANALYSIS - AVERAGE METRICS")
+        print("=" * 50)
+
+        # Create comprehensive comparison table
+        comparison_data = []
+        for result in self.results:
+            avg_metrics = result['average_metrics']
+
+            # Extract key metrics
+            row = {
+                'Scenario': result['scenario_name'],
+                'Avg Profit ($)': f"{avg_metrics.get('profit', 0):.2f}",
+                'Profit Std ($)': f"{avg_metrics.get('profit_std', 0):.2f}",
+                'Avg Throughput': f"{avg_metrics.get('total_throughput', 0):.0f}",
+                'Service Rate (%)': f"{avg_metrics.get('service_rate', 0) * 100:.1f}%",
+                'Balked Customers': f"{avg_metrics.get('balked_customers', 0):.0f}",
+                'Walk-in Wait (min)': f"{avg_metrics.get('walk_in_avg_wait', 0):.1f}" if 'walk_in_avg_wait' in avg_metrics else 'N/A',
+                'Cashier Queue': f"{avg_metrics.get('cashier_avg_length', 0):.1f}" if 'cashier_avg_length' in avg_metrics else 'N/A',
+                'Cashiers': result['parameters']['num_cashiers'],
+                'Baristas': result['parameters']['num_baristas'],
+                'Drive-thru Servers': result['parameters']['drive_thru_servers'],
+                'Drive-thru Capacity': result['parameters']['drive_thru_capacity']
+            }
+
+            # Add confidence interval if available
+            if 'profit_ci' in result:
+                ci_lower, ci_upper = result['profit_ci']
+                row['Profit 95% CI'] = f"(${ci_lower:.2f}, ${ci_upper:.2f})"
+            else:
+                row['Profit 95% CI'] = 'N/A'
+
+            comparison_data.append(row)
+
+        df_comparison = pd.DataFrame(comparison_data)
+        print("\nComprehensive Comparison Table:")
+        print(df_comparison.to_string(index=False))
+
+        # Find optimal configuration based on multiple criteria
+        print("\n" + "=" * 50)
+        print("OPTIMAL CONFIGURATION ANALYSIS")
+        print("=" * 50)
+
+        # Compare scenarios across multiple dimensions
+        for i, result in enumerate(self.results):
+            print(f"\n{result['scenario_name']}:")
+            avg_metrics = result['average_metrics']
+
+            # Calculate metrics per staff member
+            num_staff = (result['parameters']['num_cashiers'] +
+                         result['parameters']['num_baristas'] +
+                         result['parameters']['num_cooks'] +
+                         result['parameters']['drive_thru_servers'])
+
+            profit_per_staff = avg_metrics.get('profit', 0) / num_staff
+            throughput_per_staff = avg_metrics.get('total_throughput', 0) / num_staff
+
+            print(f"  Staff Count: {num_staff}")
+            print(f"  Profit per Staff: ${profit_per_staff:.2f}")
+            print(f"  Throughput per Staff: {throughput_per_staff:.1f}")
+
+        # Determine optimal based on profit
+        best_profit_scenario = max(self.results,
+                                   key=lambda x: x['average_metrics'].get('profit', 0))
+        print(f"\n★ Optimal Configuration (Profit): {best_profit_scenario['scenario_name']}")
+        print(f"  Maximum Average Profit: ${best_profit_scenario['average_metrics'].get('profit', 0):.2f}")
+
+        return df_comparison
+
+    def create_detailed_statistics_report(self):
+        """Create detailed statistics report for all scenarios"""
+        print("\n" + "=" * 60)
+        print("DETAILED STATISTICAL REPORT")
+        print("=" * 60)
+
+        for result in self.results:
+            print(f"\n{'=' * 40}")
+            print(f"SCENARIO: {result['scenario_name']}")
+            print(f"{'=' * 40}")
+
+            # Display individual run results
+            print("\nIndividual Run Results:")
+            print("-" * 30)
+            for rep in result['detailed_results']:
+                print(f"  Run {rep['replication'] + 1} (Seed {rep['seed']}):")
+                print(f"    Profit: ${rep['metrics'].get('profit', 0):.2f}")
+                print(f"    Throughput: {rep['metrics'].get('total_throughput', 0)}")
+                print(f"    Service Rate: {rep['metrics'].get('service_rate', 0) * 100:.1f}%")
+                if 'walk_in_avg_wait' in rep['metrics']:
+                    print(f"    Walk-in Wait: {rep['metrics'].get('walk_in_avg_wait', 0):.1f} min")
+
+            # Display comprehensive averages
+            avg_metrics = result['average_metrics']
+            print("\nAverage Statistics (across 5 runs):")
+            print("-" * 30)
+
+            # Group metrics by category
+            categories = {
+                'Financial': ['profit', 'revenue', 'labor_cost', 'penalties'],
+                'Throughput': ['total_throughput', 'walk_in_throughput',
+                               'drive_thru_throughput', 'mobile_throughput'],
+                'Wait Times': ['walk_in_avg_wait', 'drive_thru_avg_wait',
+                               'mobile_avg_wait', 'walk_in_p90_wait',
+                               'drive_thru_p90_wait', 'mobile_p90_wait'],
+                'Queues': ['cashier_avg_length', 'drive_thru_avg_length',
+                           'pickup_shelf_avg_length'],
+                'Customer Experience': ['service_rate', 'balked_customers',
+                                        'reneged_customers', 'total_customers']
+            }
+
+            for category, metrics in categories.items():
+                print(f"\n{category}:")
+                for metric in metrics:
+                    if metric in avg_metrics:
+                        value = avg_metrics[metric]
+                        if any(x in metric for x in ['profit', 'revenue', 'cost']):
+                            print(f"  {metric}: ${value:.2f}")
+                        elif 'rate' in metric:
+                            print(f"  {metric}: {value * 100:.1f}%")
+                        elif 'wait' in metric or 'length' in metric:
+                            print(f"  {metric}: {value:.2f}")
+                        else:
+                            print(f"  {metric}: {value:.0f}")
+
+            # Display variability metrics
+            print("\nVariability Metrics:")
+            print("-" * 20)
+            for metric in ['profit', 'total_throughput', 'service_rate']:
+                if f'{metric}_std' in avg_metrics:
+                    std = avg_metrics[f'{metric}_std']
+                    mean = avg_metrics[metric]
+                    if mean != 0:
+                        cv = (std / mean) * 100
+                        print(f"  {metric}: CV = {cv:.1f}% (Std Dev = {std:.2f})")
+
+            print()
+
+    def export_detailed_statistics(self, filename="detailed_statistics.csv"):
+        """Export detailed statistics to CSV file"""
+        if not self.results:
+            print("No results to export. Run scenarios first.")
+            return
+
+        all_data = []
+
+        for scenario_result in self.results:
+            scenario_name = scenario_result['scenario_name']
+
+            # Add individual run data
+            for rep in scenario_result['detailed_results']:
+                row = {
+                    'Scenario': scenario_name,
+                    'Replication': rep['replication'] + 1,
+                    'Random_Seed': rep['seed'],
+                    'Type': 'Individual_Run'
+                }
+                row.update(rep['metrics'])
+                all_data.append(row)
+
+            # Add average data
+            avg_row = {
+                'Scenario': scenario_name,
+                'Replication': 'Average',
+                'Random_Seed': 'N/A',
+                'Type': 'Average_Across_Runs'
+            }
+            avg_row.update(scenario_result['average_metrics'])
+            all_data.append(avg_row)
+
+        # Create DataFrame and save to CSV
+        df = pd.DataFrame(all_data)
+
+        # Reorder columns for readability
+        cols = ['Scenario', 'Replication', 'Random_Seed', 'Type'] + \
+               [c for c in df.columns if c not in ['Scenario', 'Replication', 'Random_Seed', 'Type']]
+        df = df[cols]
+
+        df.to_csv(filename, index=False)
+        print(f"\nDetailed statistics exported to '{filename}'")
+
+        return df
+
+
+ 
 # VISUALIZATION GENERATOR CLASS
-
+ 
 class VisualizationGenerator:
     """Generates professional visualizations for simulation results"""
 
@@ -502,7 +961,9 @@ class VisualizationGenerator:
         # Plot 4: Throughput vs Profit scatter
         ax4 = fig.add_subplot(gs[1, 1])
 
+        # Get profits for bubble chart
         profits = [r['average_metrics'].get('profit', 0) for r in self.results]
+
         # Use bubble chart where size represents profit
         sizes = [p / 50 for p in profits]  # Scale for visualization
 
@@ -908,7 +1369,7 @@ class VisualizationGenerator:
             'Cashiers': [0.85, 0.65, 0.80],
             'Baristas': [0.90, 0.70, 0.85],
             'Cooks': [0.75, 0.60, 0.78],
-            'Drive-thru': [0.05, 0.10, 0.06]
+            'Drive-thru': [0.05, 0.10, 0.15]  # Higher for increased capacity scenario
         }
 
         # Plot 1: Resource utilization bar chart
@@ -940,7 +1401,8 @@ class VisualizationGenerator:
         staff_allocation = {
             'Cashiers': [2, 3, 2],
             'Baristas': [3, 4, 3],
-            'Cooks': [4, 5, 4]
+            'Cooks': [4, 5, 4],
+            'Drive-thru': [2, 2, 3]
         }
 
         bottom = np.zeros(len(scenarios))
@@ -978,6 +1440,7 @@ class VisualizationGenerator:
         # Identify potential bottlenecks (high utilization + long queues)
         bottleneck_scores = []
         for i, scenario in enumerate(scenarios):
+            # Simple bottleneck score based on utilization and queue length
             util_score = max(resource_data[r][i] for r in ['Cashiers', 'Baristas', 'Cooks'])
             queue_score = self.results[i]['average_metrics'].get('cashier_avg_length', 0) / 10
             bottleneck_scores.append(util_score + queue_score)
@@ -1005,8 +1468,9 @@ class VisualizationGenerator:
         return fig
 
 
+ 
 # MAIN FUNCTION
-
+ 
 def main():
     """Main function to run the simulation study"""
     print("Tim Hortons Queueing Network Simulation")
@@ -1042,8 +1506,9 @@ def main():
     return results, detailed_df, plots
 
 
+ 
 # EXECUTION ENTRY POINT
-
+ 
 if __name__ == "__main__":
     # Run the simulation
     simulation_results, detailed_stats, visualizations = main()

@@ -1,4 +1,4 @@
-Scenario,Avg Profit ($),Profit Std ($),Avg Throughput,Service Rate (%),Balked Customers,Walk-in Wait (min),Cashier Queue,Cashiers,Baristas,Shelf Capacity,Profit 95% CI
-Base Configuration,2876.60,328.05,1524,38.9%,1941,49.4,3.7,2,3,15,"($2421.20, $3332.00)"
-Increased Staff,4512.00,200.74,1755,44.1%,1811,38.8,1.6,3,4,15,"($4233.33, $4790.67)"
-Larger Pickup Shelf,3071.30,287.16,1530,39.0%,1913,50.8,4.0,2,3,25,"($2672.66, $3469.94)"
+Scenario,Avg Profit ($),Profit Std ($),Avg Throughput,Service Rate (%),Balked Customers,Walk-in Wait (min),Cashier Queue,Cashiers,Baristas,Drive-thru Servers,Drive-thru Capacity,Profit 95% CI
+Base Configuration,2876.60,328.05,1524,38.9%,1941,49.4,3.7,2,3,2,8,"($2421.20, $3332.00)"
+Increased Staff,4512.00,200.74,1755,44.1%,1811,38.8,1.6,3,4,2,8,"($4233.33, $4790.67)"
+Increased Drive-thru Capacity,2587.70,238.41,1525,38.6%,1919,55.2,4.1,2,3,3,15,"($2256.74, $2918.66)"
